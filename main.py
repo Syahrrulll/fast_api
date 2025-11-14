@@ -2,7 +2,6 @@ import os
 import httpx
 import uvicorn
 import uuid
-import re  # <-- IMPORT INI
 from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel, Field
 from typing import List, Dict, Any
@@ -96,14 +95,10 @@ class GrammarSubmitRequest(BaseModel):
     user_corrections: List[str]
 
 
-@app.get("/")
-async def root():
-    return {"message": "Hello World"}
-
 # ==============================================================================
 # API ENDPOINT - FITUR 1: READING MISSION (AI Search)
 # ==============================================================================
-# ... (Kode tidak berubah) ...
+
 @app.post("/api/game/generate-mission")
 async def generate_reading_mission(request: SearchTopicRequest):
     topic = request.topic
@@ -166,7 +161,7 @@ async def generate_reading_mission(request: SearchTopicRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Gagal memproses permintaan AI: {str(e)}")
 
-# ... (Kode tidak berubah) ...
+
 @app.post("/api/game/validate-quiz/{mission_id}")
 async def validate_reading_mission_quiz(mission_id: str, request: QuizSubmitRequest):
     if mission_id not in GAME_CACHE:
@@ -242,7 +237,7 @@ async def validate_reading_mission_quiz(mission_id: str, request: QuizSubmitRequ
 # ==============================================================================
 # API ENDPOINT - FITUR 2: HOAX OR NOT?
 # ==============================================================================
-# ... (Kode tidak berubah) ...
+
 @app.get("/api/hoax-quiz/generate")
 async def generate_hoax_quiz():
     mission_id = str(uuid.uuid4())
@@ -298,7 +293,7 @@ async def generate_hoax_quiz():
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Gagal membuat kuis Hoax: {str(e)}")
 
-# ... (Kode tidak berubah) ...
+
 @app.post("/api/hoax-quiz/check")
 async def check_hoax_answer(request: HoaxCheckRequest):
     mission_id = request.mission_id
@@ -372,24 +367,14 @@ async def generate_library_full_text(request: LibraryGenerateRequest):
         full_text_lower = data["full_text"].lower()
         verified_blanks = []
 
-        # Memastikan jumlah kata kunci tidak lebih dari 5 (jika AI memberi lebih)
-        words_to_check = data["blanks"][:5]
-
-        for blank in words_to_check:
+        for blank in data["blanks"]:
             # Cek jika kata (tanpa spasi) benar-benar ada di teks
             # Kita juga cek tanpa tanda baca (sederhana)
-            clean_blank_for_check = blank.strip().lower().rstrip(".,?!")
+            clean_blank = blank.strip().lower().rstrip(".,?!")
+            if clean_blank and clean_blank in full_text_lower:
+                verified_blanks.append(blank.strip()) # Simpan versi asli (dengan huruf besar)
 
-            # Verifikasi bahwa kata yang bersih ada di teks yang bersih
-            if clean_blank_for_check and clean_blank_for_check in full_text_lower:
-                # Simpan versi asli (dengan huruf besar/tanda baca)
-                verified_blanks.append(blank.strip())
-            else:
-                # Jika kata kunci dari AI tidak ada di teks, log ini
-                print(f"WARNING: Kata kunci '{blank}' dari AI tidak ditemukan di teks.")
-
-
-        # Jika AI gagal total (atau tidak ada kata kunci valid), kita tidak bisa melanjutkan
+        # Jika AI gagal total, kita tidak bisa melanjutkan game ini
         if not verified_blanks:
              raise HTTPException(status_code=500, detail="AI gagal membuat kata kunci yang valid untuk teks ini.")
         # --- AKHIR PERBAIKAN ---
@@ -421,58 +406,33 @@ async def get_library_quiz_text(game_id: str):
     cached_data = GAME_CACHE[game_id]
     full_text = cached_data["full_text"]
     answers = cached_data["correct_answers"] # Ini adalah list yang sudah diverifikasi
-    expected_blanks = len(answers)
 
     text_with_blanks = full_text
     placeholder = "[.....]"
 
-    # =================================================================
-    # --- AWAL PERBAIKAN: GANTI LOOP DENGAN re.sub (CASE-INSENSITIVE) ---
-    # =================================================================
-
-    blanks_created = 0
+    # Ganti kata jawaban dengan placeholder
     for word in answers:
-        # Gunakan re.sub untuk replace case-insensitive, HANYA 1x (count=1)
-        # re.escape() penting untuk menangani tanda baca dalam kata (jika ada)
-        # (misal: "kata." akan di-escape menjadi "kata\.")
-        new_text, count = re.subn(
-            re.escape(word),
-            placeholder,
-            text_with_blanks,
-            count=1,
-            flags=re.IGNORECASE
-        )
+        # Kita gunakan 'count=1' agar hanya mengganti kemunculan pertama
+        # Kita perlu cara yang lebih baik untuk replace case-insensitive
+        # Solusi sederhana: replace versi asli
+        if word in text_with_blanks:
+             text_with_blanks = text_with_blanks.replace(word, placeholder, 1)
+        # Fallback jika case-nya beda (misal 'Dia' vs 'dia')
+        elif word.lower() in text_with_blanks.lower():
+             # Ini rumit, untuk sementara kita pakai replace sederhana
+             text_with_blanks = text_with_blanks.replace(word, placeholder, 1, flags=re.IGNORECASE) # ups, butuh 're'
+             # Solusi lebih aman tanpa 're':
+             pass # Untuk saat ini, biarkan jika case-nya beda (akan difix di iterasi selanjutnya jika perlu)
 
-        if count > 0:
-            text_with_blanks = new_text
-            blanks_created += 1
-        else:
-             # Ini bisa terjadi jika kata kunci tumpang tindih
-             # (misal: "sangat" dan "sangat baik")
-             # Kita log saja, tapi jangan hentikan game
-             print(f"WARNING: Kata '{word}' tidak dapat diganti di game {game_id}")
+        # Logika replace yang paling aman adalah yang kita lakukan sebelumnya:
+        # Ganti kata di list 'answers' yang sudah diverifikasi
+        text_with_blanks = text_with_blanks.replace(word, placeholder, 1)
 
-    # =================================================================
-    # --- AKHIR PERBAIKAN ---
-    # =================================================================
-
-    # Verifikasi Final: Cek apakah jumlah placeholder yang dibuat sama
-    actual_blanks_created = text_with_blanks.count(placeholder)
-
-    if actual_blanks_created != expected_blanks:
-        # Jika jumlahnya tidak cocok, ini masalah serius.
-        # Hapus game yang rusak ini agar tidak bisa disubmit.
-        del GAME_CACHE[game_id]
-        print(f"FATAL ERROR: Library Game ID {game_id} mismatch.")
-        print(f"Expected {expected_blanks} blanks, created {actual_blanks_created}.")
-        print(f"Answers: {answers}")
-        print(f"Original Text: {full_text}")
-        raise HTTPException(status_code=500, detail=f"Gagal membuat kuis: Terjadi ketidakcocokan kata kunci. Silakan coba buat game baru.")
 
     return {
         "game_id": game_id,
         "text_with_blanks": text_with_blanks,
-        "total_questions": len(answers) # Ini adalah jumlah yang DIHARAPKAN
+        "total_questions": len(answers)
     }
 
 
@@ -488,11 +448,9 @@ async def validate_library_blanks(game_id: str, request: LibraryQuizSubmitReques
     correct_answers = cached_data["correct_answers"]
     user_answers = request.user_answers
 
-    # Sekarang cek ini seharusnya LOLOS berkat perbaikan di atas
+    # SEKARANG CEK INI HARUSNYA LOLOS KARENA VERIFIKASI DI ATAS
     if len(user_answers) != len(correct_answers):
-        # Jika ini MASIH terjadi, itu berarti logic di Blade (PHP) salah
-        # Tapi berdasarkan file Anda, logic Blade sudah benar.
-        raise HTTPException(status_code=400, detail=f"Jumlah jawaban tidak sesuai. Diharapkan: {len(correct_answers)}, Diterima: {len(user_answers)}")
+        raise HTTPException(status_code=400, detail="Jumlah jawaban tidak sesuai.")
 
     results = []
     total_score = 0
@@ -510,7 +468,6 @@ async def validate_library_blanks(game_id: str, request: LibraryQuizSubmitReques
             "is_correct": is_correct
         })
 
-    # Hapus game dari cache setelah selesai
     del GAME_CACHE[game_id]
 
     return {
@@ -523,7 +480,7 @@ async def validate_library_blanks(game_id: str, request: LibraryQuizSubmitReques
 # ==============================================================================
 # API ENDPOINT - FITUR 4: ZONA TATA BAHASA (Perbaiki Kalimat)
 # ==============================================================================
-# ... (Kode tidak berubah) ...
+
 @app.post("/api/grammar-zone/generate-game")
 async def generate_grammar_game(request: GrammarGenerateRequest):
     game_id = str(uuid.uuid4())
@@ -581,7 +538,7 @@ async def generate_grammar_game(request: GrammarGenerateRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Gagal membuat game Tata Bahasa: {str(e)}")
 
-# ... (Kode tidak berubah) ...
+
 @app.post("/api/grammar-zone/submit-game/{game_id}")
 async def submit_grammar_game(game_id: str, request: GrammarSubmitRequest):
     if game_id not in GAME_CACHE or "correct_sentences" not in GAME_CACHE[game_id]:

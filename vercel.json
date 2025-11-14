@@ -1,13 +1,13 @@
 {
   "version": 2,
   "builds": [
-    { "src": "app.py", "use": "@vercel/python" }
+    { "src": "main.py", "use": "@vercel/python" }
   ],
   "routes": [
     { "src": "/(.*)", "dest": "/main.py" }
   ],
     "env": {
-    "OPENAI_API_KEY": "@openai_api_key",
-    "APP_MODULE": "main:app"
+    "APP_MODULE": "main:app",
+    "GEMINI_API_KEY": "AIzaSyBztaGYUxg3Mk7oVZWYYoH8euvz8Enh1ZI"
   }
 }
