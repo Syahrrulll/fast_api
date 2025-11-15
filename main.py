@@ -16,7 +16,7 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "AIzaSyBztaGYUxg3Mk7oVZWYYoH8e
 if not GEMINI_API_KEY:
     raise EnvironmentError("GEMINI_API_KEY environment variable not set.")
 
-GEMINI_API_URL = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-09-2025:generateContent?key={GEMINI_API_KEY}"
+GEMINI_API_URL = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:generateContent?key={GEMINI_API_KEY}"
 
 # Klien HTTP Async untuk performa FastAPI yang lebih baik
 client = httpx.AsyncClient(timeout=60.0)
