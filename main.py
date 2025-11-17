@@ -185,7 +185,7 @@ async def generate_reading_mission(request: SearchTopicRequest):
     }
 
     try:
-        response_data = await call_gemini_api(payload)
+        response_data = await call_ai(payload)
         generated_data = response_data["candidates"][0]["content"]["parts"][0]["text"]
         import json
         data = json.loads(generated_data)
@@ -263,7 +263,7 @@ async def validate_reading_mission_quiz(mission_id: str, request: QuizSubmitRequ
     }
 
     try:
-        response_data = await call_gemini_api(payload)
+        response_data = await call_ai(payload)
         generated_data = response_data["candidates"][0]["content"]["parts"][0]["text"]
         import json
         data = json.loads(generated_data)
@@ -318,7 +318,7 @@ async def generate_hoax_quiz():
     }
 
     try:
-        response_data = await call_gemini_api(payload)
+        response_data = await call_ai(payload)
         generated_data = response_data["candidates"][0]["content"]["parts"][0]["text"]
 
         import json
@@ -401,7 +401,7 @@ async def generate_library_full_text(request: LibraryGenerateRequest):
     }
 
     try:
-        response_data = await call_gemini_api(payload)
+        response_data = await call_ai(payload)
         generated_data = response_data["candidates"][0]["content"]["parts"][0]["text"]
 
         import json
@@ -563,7 +563,7 @@ async def generate_grammar_game(request: GrammarGenerateRequest):
     }
 
     try:
-        response_data = await call_gemini_api(payload)
+        response_data = await call_ai(payload)
         generated_data = response_data["candidates"][0]["content"]["parts"][0]["text"]
 
         import json
