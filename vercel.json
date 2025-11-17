@@ -8,6 +8,6 @@
   ],
     "env": {
     "APP_MODULE": "main:app",
-    "GEMINI_API_KEY": "AIzaSyBztaGYUxg3Mk7oVZWYYoH8euvz8Enh1ZI"
+    "CUSTOM_API_KEY": "cpk_49d03a0e918f44c5b753d8aefa411eb0.0140b8ee2e8c5bfbae7e6bc921a677ba.VYnSymDVRjdpY53MK4NduBfyff9RKdoD"
   }
 }

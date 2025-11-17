@@ -11,57 +11,143 @@ from typing import List, Dict, Any
 # ==============================================================================
 app = FastAPI(title="Literise AI Service", version="1.0")
 
-# --- MASUKKAN API KEY ANDA DI SINI ---
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "AIzaSyBztaGYUxg3Mk7oVZWYYoH8euvz8Enh1ZI") # <-- KUNCI BARU ANDA
-if not GEMINI_API_KEY:
-    raise EnvironmentError("GEMINI_API_KEY environment variable not set.")
+API_KEY = os.environ.get("CUSTOM_API_KEY", "cpk_49d03a0e918f44c5b753d8aefa411eb0.0140b8ee2e8c5bfbae7e6bc921a677ba.VYnSymDVRjdpY53MK4NduBfyff9RKdoD")
+if not API_KEY:
+    raise EnvironmentError("CUSTOM_API_KEY environment variable tidak ada.")
 
-GEMINI_API_URL = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-lite:generateContent?key={GEMINI_API_KEY}"
+API_URL = f"https://llm.chutes.ai/v1/chat/completions?key={API_KEY}"
 
-# Klien HTTP Async untuk performa FastAPI yang lebih baik
+MODEL_NAME = "gpt-4o-mini"
+
 client = httpx.AsyncClient(timeout=60.0)
 
-# Penyimpanan Cache Sederhana (Simulasi Database)
+# Cache
 GAME_CACHE = {}
 
+# ==============================================================================
+# FUNGSI PEMANGGIL API
+# ==============================================================================
 
-# ==============================================================================
-# FUNGSI HELPER UTAMA (PEMANGGIL API GEMINI)
-# ==============================================================================
-async def call_gemini_api(payload: Dict[str, Any]) -> Dict[str, Any]:
+async def call_chutes_api(prompt: str, response_schema=None) -> str:
     """
-    Fungsi helper untuk memanggil Gemini API dengan penanganan error.
+    Wrapper API.
+    Output mengikuti format OpenAI/chat-completions.
     """
+    messages = []
+
+    # Jika membutuhkan schema
+    if response_schema:
+        system_msg = (
+            "Anda adalah AI lITERASI. "
+            "Anda harus mengembalikan output dalam bentuk JSON VALID persis sesuai schema. "
+            "JANGAN gunakan markdown atau tambahan lain."
+            f"\nSCHEMA:\n{json.dumps(response_schema)}"
+        )
+        messages.append({"role": "system", "content": system_msg})
+    else:
+        messages.append({"role": "system", "content": "Anda adalah AI."})
+
+    messages.append({"role": "user", "content": prompt})
+
+    payload = {
+        "model": MODEL_NAME,
+        "messages": messages,
+        "temperature": 0.7
+    }
+
+    headers = {"Content-Type": "application/json"}
+
     try:
-        response = await client.post(GEMINI_API_URL, json=payload)
-        response.raise_for_status()  # Menangani error HTTP (spt 400, 500)
+        response = await client.post(API_URL, json=payload, headers=headers)
+        response.raise_for_status()
+    except httpx.HTTPError as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
-        data = response.json()
+    data = response.json()
 
-        if "candidates" not in data or not data["candidates"]:
-            prompt_feedback = data.get('promptFeedback', {})
-            block_reason = prompt_feedback.get('blockReason', 'REASON_UNSPECIFIED')
-            safety_ratings = prompt_feedback.get('safetyRatings', [])
+    # FORMAT OPENAI → AMBIL:
+    # data["choices"][0]["message"]["content"]
+    try:
+        result = data["choices"][0]["message"]["content"]
+    except Exception as err:
+        raise HTTPException(status_code=500, detail=f"Format API tidak sesuai: {err}")
+
+    # Jika schema → harus JSON
+    if response_schema:
+        try:
+            return json.loads(result)
+        except json.JSONDecodeError:
             raise HTTPException(
                 status_code=500,
-                detail=f"Error: Konten diblokir oleh Gemini. Alasan: {block_reason}. Detail: {safety_ratings}"
+                detail=f"AI tidak mengembalikan JSON valid: {result}"
             )
 
-        return data
+    return result
 
-    except httpx.HTTPStatusError as e:
-        error_body = e.response.json()
-        error_detail = error_body.get("error", {}).get("message", e.response.text)
+@app.get("/", response_class=HTMLResponse)
+async def root():
+    html = """
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+        <title>Literise AI Service</title>
+        <style>
+            body {
+                margin: 0;
+                padding: 0;
+                font-family: Arial, sans-serif;
+                background: linear-gradient(135deg, #6a5acd, #836fff, #48b1bf);
+                color: white;
+                height: 100vh;
+                display: flex;
+                justify-content: center;
+                align-items: center;
+            }
 
-        if e.response.status_code == 503: # Overloaded
-            raise HTTPException(status_code=503, detail=f"Server AI sedang sibuk (Overloaded). Coba lagi dalam beberapa saat. Detail: {error_detail}")
+            .container {
+                background: rgba(255, 255, 255, 0.1);
+                padding: 40px;
+                border-radius: 20px;
+                box-shadow: 0 8px 32px rgba(0, 0, 0, 0.2);
+                backdrop-filter: blur(10px);
+                text-align: center;
+                max-width: 450px;
+            }
 
-        raise HTTPException(
-            status_code=e.response.status_code,
-            detail=f"Error dari Gemini: {error_detail}"
-        )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error internal Python: {str(e)}")
+            h1 {
+                font-size: 32px;
+                margin-bottom: 10px;
+                font-weight: bold;
+            }
+
+            p {
+                font-size: 16px;
+                opacity: 0.9;
+            }
+
+            .status {
+                margin-top: 20px;
+                padding: 10px 20px;
+                background: #ffffff30;
+                border-radius: 10px;
+                display: inline-block;
+                font-size: 14px;
+            }
+        </style>
+    </head>
+
+    <body>
+        <div class="container">
+            <h1>Literise AI Service</h1>
+            <p>Layanan AI internal berhasil berjalan.</p>
+            <div class="status">Status: <b>ACTIVE</b></div>
+        </div>
+    </body>
+    </html>
+    """
+    return html
 
 # ==============================================================================
 # MODEL DATA (PYDANTIC) UNTUK VALIDASI REQUEST
