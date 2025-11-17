@@ -1,152 +1,190 @@
 import os
+import re
+import json
+import uuid
 import httpx
 import uvicorn
-import uuid
-from fastapi import FastAPI, HTTPException, Request, Form
-from fastapi.responses import HTMLResponse, JSONResponse
+from typing import List, Dict, Any, Optional
+
+from fastapi import FastAPI, HTTPException, Form
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
-from typing import List, Dict, Any
 
-# ==============================================================================
-# KONFIGURASI DAN KUNCI API
-# ==============================================================================
+# ======================================================================
+# CONFIG
+# ======================================================================
 app = FastAPI(title="Literise AI Service", version="1.0")
-# ==========================
-# CONFIG API AI (CHUTES)
-# ==========================
-CHUTES_API_KEY = os.getenv("CHUTES_API_KEY","cpk_49d03a0e918f44c5b753d8aefa411eb0.0140b8ee2e8c5bfbae7e6bc921a677ba.VYnSymDVRjdpY53MK4NduBfyff9RKdoD")
 
-# URL CHUTES ala gaya GEMINI
+# Ambil API key dari env (ubah di OS / Vercel); ada default untuk testing lokal
+CHUTES_API_KEY = os.getenv(
+    "CHUTES_API_KEY",
+    "cpk_49d03a0e918f44c5b753d8aefa411eb0.0140b8ee2e8c5bfbae7e6bc921a677ba.VYnSymDVRjdpY53MK4NduBfyff9RKdoD"
+)
+
+# Endpoint Chutes (tanpa ?key=)
 CHUTES_API_URL = "https://llm.chutes.ai/v1/chat/completions"
 
+# Model yang dipakai (pastikan valid di dashboard Chutes)
+MODEL_NAME = "moonshotai/Kimi-K2-Instruct-0905"
 
-# ==========================
-# HALAMAN ROOT ("/")
-# ==========================
-@app.get("/", response_class=HTMLResponse)
-async def home():
-    html = """
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <title>AI Service</title>
-        <style>
-            body {
-                margin: 0; padding: 0;
-                font-family: Arial;
-                height: 100vh;
-                display: flex;
-                justify-content: center;
-                align-items: center;
-                background: linear-gradient(135deg, #6a5acd, #48b1bf);
-                color: white;
-            }
-            .card {
-                background: rgba(255,255,255,0.15);
-                padding: 40px;
-                border-radius: 20px;
-                backdrop-filter: blur(10px);
-                text-align: center;
-                max-width: 420px;
-            }
-            h1 { margin-bottom: 10px; }
-            .status {
-                margin-top: 15px;
-                background: rgba(255,255,255,0.25);
-                padding: 8px 16px;
-                border-radius: 10px;
-            }
-        </style>
-    </head>
-    <body>
-        <div class="card">
-            <h1>AI Service</h1>
-            <p>Serverless API berjalan normal.</p>
-            <div class="status">Status: ACTIVE</div>
-        </div>
-    </body>
-    </html>
+# In-memory cache (ephemeral; serverless tidak persist)
+GAME_CACHE: Dict[str, Dict[str, Any]] = {}
+
+# ======================================================================
+# HELPERS: call chat-style API (per-request HTTP client)
+# ======================================================================
+async def call_ai_chat(messages: List[Dict[str, str]], max_tokens: Optional[int] = None) -> Dict[str, Any]:
     """
-    return HTMLResponse(content=html)
-
-# ==========================
-# FUNGSI REQUEST KE CHUTES
-# ==========================
-async def call_ai(messages: list):
+    Kirim request chat-style (OpenAI-like) ke Chutes.
+    messages: list of {"role": "system"|"user"|"assistant", "content": "..."}
+    """
     headers = {
         "Authorization": f"Bearer {CHUTES_API_KEY}",
         "Content-Type": "application/json"
     }
 
-    payload = {
-        "model": "moonshotai/Kimi-K2-Instruct-0905",
-        "messages": messages
+    payload: Dict[str, Any] = {
+        "model": MODEL_NAME,
+        "messages": messages,
+        "temperature": 0.7
     }
+    if max_tokens:
+        payload["max_tokens"] = max_tokens
 
-    async with httpx.AsyncClient(timeout=40) as client:
-        r = await client.post(CHUTES_API_URL, json=payload, headers=headers)
-        print("STATUS:", r.status_code)
-        print("RESPONSE:", r.text)
-        r.raise_for_status()
-        return r.json()
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        resp = await client.post(CHUTES_API_URL, json=payload, headers=headers)
+        # For debugging you can uncomment:
+        # print("AI STATUS:", resp.status_code)
+        # print("AI RESPONSE:", resp.text)
+        try:
+            resp.raise_for_status()
+        except httpx.HTTPStatusError as e:
+            # try to return human-friendly error
+            try:
+                err_json = resp.json()
+                detail = err_json.get("error", {}).get("message", resp.text)
+            except Exception:
+                detail = resp.text
+            raise HTTPException(status_code=resp.status_code, detail=f"AI provider error: {detail}")
+        return resp.json()
 
-# -------------------------------------------------------------------
-# GET /chat → HALAMAN HTML UNTUK TEST CHAT
-# -------------------------------------------------------------------
+async def call_ai_json(system_prompt: str, user_prompt: str, expect_json: bool = True, max_tokens: Optional[int] = None) -> Any:
+    """
+    Kirim system + user via chat, lalu ambil content (text) dari AI.
+    Jika expect_json True -> coba parse return content ke JSON.
+    Kembalikan parsed object (dict/list) jika berhasil, atau raise HTTPException.
+    """
+    messages = []
+    if system_prompt:
+        messages.append({"role": "system", "content": system_prompt})
+    messages.append({"role": "user", "content": user_prompt})
+
+    resp = await call_ai_chat(messages, max_tokens=max_tokens)
+
+    # Extract content robustly
+    content_text = None
+    try:
+        first_choice = resp.get("choices", [])[0]
+        if not first_choice:
+            raise Exception("No choices in AI response.")
+        # chat format
+        if "message" in first_choice and isinstance(first_choice["message"], dict):
+            content_text = first_choice["message"].get("content")
+        # older or text field
+        elif "text" in first_choice:
+            content_text = first_choice.get("text")
+        else:
+            # try to stringify whole response
+            content_text = json.dumps(resp)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"AI response format unexpected: {e}")
+
+    if content_text is None:
+        raise HTTPException(status_code=500, detail="AI returned empty content.")
+
+    # Try to parse JSON if expected
+    if expect_json:
+        try:
+            parsed = json.loads(content_text)
+            return parsed
+        except json.JSONDecodeError:
+            # If AI returned JSON-like with trailing text, try to extract JSON substring
+            m = re.search(r'(\{.*\}|\[.*\])', content_text, flags=re.DOTALL)
+            if m:
+                try:
+                    return json.loads(m.group(1))
+                except Exception:
+                    pass
+            raise HTTPException(status_code=500, detail=f"AI did not return valid JSON. Raw: {content_text[:500]}")
+    else:
+        return content_text
+
+# ======================================================================
+# Simple chat page (GET form + POST)
+# ======================================================================
 @app.get("/chat", response_class=HTMLResponse)
 async def chat_page():
     return """
+    <!doctype html>
     <html>
-        <head><title>Chat Kimmi</title></head>
-        <body style="font-family: Arial; padding: 20px;">
-            <h2>Chat Dengan AI (Kimmi)</h2>
-            <form action="/chat" method="post">
-                <textarea name="message" rows="5" cols="40" placeholder="Tulis pesan..."></textarea><br><br>
-                <button type="submit">Kirim</button>
-            </form>
-        </body>
+      <head>
+        <meta charset="utf-8"/>
+        <title>Chat Kimmi</title>
+        <style>
+            body { font-family: Arial, sans-serif; padding: 24px; background:#f6f7fb; }
+            .card { max-width:800px; margin:auto; background:white; padding:20px; border-radius:10px; box-shadow:0 8px 24px rgba(0,0,0,0.08); }
+            textarea { width:100%; height:140px; padding:10px; border-radius:8px; border:1px solid #ddd; resize:vertical; }
+            button { padding:10px 16px; border-radius:8px; background:#4f46e5; color:white; border:none; cursor:pointer; }
+            pre { background:#f3f4ff; padding:12px; border-radius:8px; white-space:pre-wrap; }
+        </style>
+      </head>
+      <body>
+        <div class="card">
+          <h2>Chat dengan Kimmi (test)</h2>
+          <form action="/chat" method="post">
+            <textarea name="message" placeholder="Ketik pesan..."></textarea><br/><br/>
+            <button type="submit">Kirim</button>
+          </form>
+        </div>
+      </body>
     </html>
     """
 
-# -------------------------------------------------------------------
-# POST /chat → MEMPROSES FORM HTML
-# -------------------------------------------------------------------
+from fastapi import Form
+
 @app.post("/chat", response_class=HTMLResponse)
-async def chat(message: str = Form(...)):
-    messages = [
-        {"role": "user", "content": message}
-    ]
-
-    ai_res = await call_ai(messages)
-    reply = ai_res["choices"][0]["message"]["content"]
-
-    return f"""
+async def chat_page_post(message: str = Form(...)):
+    # send as simple user message; you can include system prompt to set persona
+    system_prompt = "Kamu adalah Kimmi, asisten ramah yang membantu dengan singkat dan jelas."
+    try:
+        # we expect plain text back
+        reply = await call_ai_json(system_prompt=system_prompt, user_prompt=message, expect_json=False, max_tokens=400)
+    except HTTPException as e:
+        # show error on page
+        return HTMLResponse(f"<h3>Error memanggil AI:</h3><pre>{e.detail}</pre><a href='/chat'>Kembali</a>")
+    return HTMLResponse(f"""
     <html>
-        <body style="font-family: Arial; padding: 20px;">
-            <h2>Jawaban AI:</h2>
-            <pre>{reply}</pre>
-            <br>
-            <a href="/chat">Kembali</a>
-        </body>
+      <body style="font-family: Arial; padding:20px;">
+        <h2>Jawaban AI:</h2>
+        <pre>{reply}</pre>
+        <br/><a href="/chat">Kembali</a>
+      </body>
     </html>
-    """
-# ==============================================================================
-# MODEL DATA (PYDANTIC) UNTUK VALIDASI REQUEST
-# ==============================================================================
+    """)
 
-# --- Fitur 1: Reading Mission ---
+# ======================================================================
+# Pydantic models (request validation)
+# ======================================================================
 class SearchTopicRequest(BaseModel):
     topic: str = Field(..., example="Efek Pemanasan Global")
 
 class QuizSubmitRequest(BaseModel):
     answers: List[Dict[str, str]] = Field(..., example=[{"question": "Q1", "answer": "A1"}])
 
-# --- Fitur 2: Hoax or Not? ---
 class HoaxCheckRequest(BaseModel):
     mission_id: str
     user_choice: str = Field(..., example="Hoax")
 
-# --- Fitur 3: Library Hub (Melengkapi Kata) ---
 class LibraryGenerateRequest(BaseModel):
     format: str = Field(..., example="Cerpen")
     genre: str = Field(..., example="Fantasy")
@@ -154,18 +192,15 @@ class LibraryGenerateRequest(BaseModel):
 class LibraryQuizSubmitRequest(BaseModel):
     user_answers: List[str]
 
-# --- Fitur 4: Zona Tata Bahasa ---
 class GrammarGenerateRequest(BaseModel):
     genre: str = Field(..., example="Slice of Life")
 
 class GrammarSubmitRequest(BaseModel):
     user_corrections: List[str]
 
-
-# ==============================================================================
-# API ENDPOINT - FITUR 1: READING MISSION (AI Search)
-# ==============================================================================
-
+# ======================================================================
+# Endpoint: generate reading mission (refactored -> use call_ai_json)
+# ======================================================================
 @app.post("/api/game/generate-mission")
 async def generate_reading_mission(request: SearchTopicRequest):
     topic = request.topic
@@ -173,478 +208,245 @@ async def generate_reading_mission(request: SearchTopicRequest):
 
     system_prompt = (
         "Anda adalah asisten edukasi untuk platform literasi bernama Literise. "
-        "Tugas Anda adalah membuat misi membaca berdasarkan topik yang diminta pengguna. "
-        "Anda HARUS menghasilkan dua hal: "
-        "1. 'reading_text': Artikel singkat (sekitar 150-200 kata) tentang topik tersebut. Gunakan paragraf (\\n\\n). "
-        "2. 'quiz_questions': TEPAT 3 pertanyaan pemahaman (tipe esai singkat) HANYA berdasarkan teks yang Anda tulis. "
-        "3. 'correct_answers': Jawaban singkat dan ideal untuk setiap pertanyaan."
-        "JANGAN gunakan Markdown (seperti #, *, atau **)."
+        "Buat artikel singkat sekitar 150-200 kata, lalu buat tepat 3 pertanyaan pemahaman dan jawaban ideal. "
+        "Kembalikan hasil sebagai JSON object dengan keys: reading_text, quiz_questions (array of strings), correct_answers (array of strings). "
+        "JANGAN gunakan Markdown."
     )
     user_prompt = f"Topik: {topic}"
 
-    payload = {
-        "systemInstruction": {"parts": [{"text": system_prompt}]},
-        "contents": [{"parts": [{"text": user_prompt}]}],
-        "generationConfig": {
-            "responseMimeType": "application/json",
-            "responseSchema": {
-                "type": "OBJECT",
-                "properties": {
-                    "reading_text": {"type": "STRING"},
-                    "quiz_questions": {
-                        "type": "ARRAY",
-                        "items": {"type": "STRING"},
-                        "description": "Tepat 3 pertanyaan"
-                    },
-                    "correct_answers": {
-                        "type": "ARRAY",
-                        "items": {"type": "STRING"},
-                        "description": "Tepat 3 jawaban"
-                    }
-                },
-                "required": ["reading_text", "quiz_questions", "correct_answers"]
-            }
-        }
+    try:
+        data = await call_ai_json(system_prompt=system_prompt, user_prompt=user_prompt, expect_json=True, max_tokens=800)
+    except HTTPException as e:
+        raise HTTPException(status_code=500, detail=f"Gagal membuat misi dari AI. Coba lagi. Detail: {e.detail}")
+
+    # validate fields
+    if not all(k in data for k in ("reading_text", "quiz_questions", "correct_answers")):
+        raise HTTPException(status_code=500, detail="AI tidak mengembalikan field yang diperlukan.")
+
+    # store in cache
+    GAME_CACHE[mission_id] = {
+        "title": topic,
+        "questions": data["quiz_questions"],
+        "answers": data["correct_answers"]
     }
 
-    try:
-        response_data = await call_ai(payload)
-        generated_data = response_data["candidates"][0]["content"]["parts"][0]["text"]
-        import json
-        data = json.loads(generated_data)
+    return {
+        "mission_id": mission_id,
+        "title": topic,
+        "reading_text": data["reading_text"],
+        "quiz_questions": [{"question": q} for q in data["quiz_questions"]]
+    }
 
-        GAME_CACHE[mission_id] = {
-            "title": topic,
-            "questions": data["quiz_questions"],
-            "answers": data["correct_answers"]
-        }
-
-        return {
-            "mission_id": mission_id,
-            "title": topic,
-            "reading_text": data["reading_text"],
-            "quiz_questions": [{"question": q} for q in data["quiz_questions"]]
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Gagal memproses permintaan AI: {str(e)}")
-
-
+# ======================================================================
+# Endpoint: validate reading mission quiz
+# ======================================================================
 @app.post("/api/game/validate-quiz/{mission_id}")
 async def validate_reading_mission_quiz(mission_id: str, request: QuizSubmitRequest):
     if mission_id not in GAME_CACHE:
         raise HTTPException(status_code=404, detail="Misi tidak ditemukan atau sudah kedaluwarsa.")
 
-    cached_data = GAME_CACHE[mission_id]
-    correct_answers = cached_data["answers"]
-    user_answers = [ans["answer"] for ans in request.answers]
-    questions = cached_data["questions"]
+    cached = GAME_CACHE[mission_id]
+    correct_answers = cached["answers"]
+    user_answers = [a["answer"] for a in request.answers]
+    questions = cached["questions"]
 
     if len(user_answers) != len(correct_answers):
         raise HTTPException(status_code=400, detail="Jumlah jawaban tidak sesuai.")
 
     system_prompt = (
         "Anda adalah seorang guru yang menilai kuis pemahaman. "
-        "Bandingkan setiap 'jawaban_pengguna' dengan 'jawaban_ideal'. "
-        "Berikan 'skor' (0 hingga 100) dan 'umpan_balik' singkat untuk SETIAP jawaban. "
-        "JANGAN tambahkan penjelasan umum, hanya fokus pada daftar hasil."
+        "Bandingkan setiap jawaban pengguna dengan jawaban ideal. "
+        "Kembalikan JSON: { results: [ {question, user_answer, score, feedback} ], total_score }"
     )
 
-    prompt_sections = [f"Konteks Misi: {cached_data['title']}"]
+    user_prompt_parts = [f"Konteks Misi: {cached['title']}"]
     for i in range(len(questions)):
-        prompt_sections.append(f"\nPertanyaan {i+1}: {questions[i]}")
-        prompt_sections.append(f"Jawaban Ideal {i+1}: {correct_answers[i]}")
-        prompt_sections.append(f"Jawaban Pengguna {i+1}: {user_answers[i]}")
-
-    user_prompt = "\n".join(prompt_sections)
-
-    payload = {
-        "systemInstruction": {"parts": [{"text": system_prompt}]},
-        "contents": [{"parts": [{"text": user_prompt}]}],
-        "generationConfig": {
-            "responseMimeType": "application/json",
-            "responseSchema": {
-                "type": "OBJECT",
-                "properties": {
-                    "results": {
-                        "type": "ARRAY",
-                        "items": {
-                            "type": "OBJECT",
-                            "properties": {
-                                "question": {"type": "STRING"},
-                                "user_answer": {"type": "STRING"},
-                                "score": {"type": "NUMBER"},
-                                "feedback": {"type": "STRING"}
-                            },
-                            "required": ["question", "user_answer", "score", "feedback"]
-                        }
-                    },
-                    "total_score": {"type": "NUMBER"}
-                },
-                "required": ["results", "total_score"]
-            }
-        }
-    }
+        user_prompt_parts.append(f"Pertanyaan {i+1}: {questions[i]}")
+        user_prompt_parts.append(f"Jawaban Ideal {i+1}: {correct_answers[i]}")
+        user_prompt_parts.append(f"Jawaban Pengguna {i+1}: {user_answers[i]}")
+    user_prompt = "\n".join(user_prompt_parts)
 
     try:
-        response_data = await call_ai(payload)
-        generated_data = response_data["candidates"][0]["content"]["parts"][0]["text"]
-        import json
-        data = json.loads(generated_data)
-        del GAME_CACHE[mission_id]
+        data = await call_ai_json(system_prompt=system_prompt, user_prompt=user_prompt, expect_json=True, max_tokens=800)
+    except HTTPException as e:
+        raise HTTPException(status_code=500, detail=f"Gagal menilai kuis: {e.detail}")
 
-        return {
-            "title": cached_data["title"],
-            "total_score": data["total_score"],
-            "results": data["results"]
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Gagal menilai kuis: {str(e)}")
+    # cleanup cache
+    del GAME_CACHE[mission_id]
+    return {
+        "title": cached["title"],
+        "total_score": data.get("total_score", 0),
+        "results": data.get("results", [])
+    }
 
-
-# ==============================================================================
-# API ENDPOINT - FITUR 2: HOAX OR NOT?
-# ==============================================================================
-
+# ======================================================================
+# Endpoint: Hoax quiz generate + check
+# ======================================================================
 @app.get("/api/hoax-quiz/generate")
 async def generate_hoax_quiz():
     mission_id = str(uuid.uuid4())
-
     system_prompt = (
-        "Anda adalah asisten pembuat kuis literasi media. "
-        "Tugas Anda adalah membuat SATU skenario berita (nyata atau hoaks) yang viral. "
-        "Anda HARUS menghasilkan 4 hal: "
-        "1. 'news_snippet': Teks berita (sekitar 2-3 kalimat) seolah-olah viral di media sosial. "
-        "2. 'is_hoax': Boolean (true jika hoaks, false jika fakta). "
-        "3. 'explanation': Penjelasan logis mengapa ini hoaks atau fakta. "
-        "4. 'source_url': URL sumber (jika fakta) atau URL halaman debunk (jika hoaks). Gunakan 'N/A' jika tidak relevan. "
-        "Topiknya harus beragam (kesehatan, politik, sains, hiburan)."
-        "JANGAN gunakan Markdown."
+        "Anda adalah pembuat kuis literasi media. Buat satu skenario berita viral (2-3 kalimat), "
+        "tunjukkan apakah itu hoax (true/false), berikan penjelasan singkat, dan source_url atau 'N/A'. "
+        "Return JSON with keys: news_snippet, is_hoax, explanation, source_url."
     )
-    user_prompt = "Buatkan saya satu skenario kuis 'Hoax or Not?' baru."
-
-    payload = {
-        "systemInstruction": {"parts": [{"text": system_prompt}]},
-        "contents": [{"parts": [{"text": user_prompt}]}],
-        "generationConfig": {
-            "responseMimeType": "application/json",
-            "responseSchema": {
-                "type": "OBJECT",
-                "properties": {
-                    "news_snippet": {"type": "STRING"},
-                    "is_hoax": {"type": "BOOLEAN"},
-                    "explanation": {"type": "STRING"},
-                    "source_url": {"type": "STRING"}
-                },
-                "required": ["news_snippet", "is_hoax", "explanation"]
-            }
-        }
-    }
+    user_prompt = "Buat satu skenario kuis 'Hoax or Not?'"
 
     try:
-        response_data = await call_ai(payload)
-        generated_data = response_data["candidates"][0]["content"]["parts"][0]["text"]
+        data = await call_ai_json(system_prompt=system_prompt, user_prompt=user_prompt, expect_json=True, max_tokens=400)
+    except HTTPException as e:
+        raise HTTPException(status_code=500, detail=f"Gagal membuat kuis Hoax: {e.detail}")
 
-        import json
-        data = json.loads(generated_data)
+    GAME_CACHE[mission_id] = {
+        "is_hoax": data.get("is_hoax", False),
+        "explanation": data.get("explanation", ""),
+        "source_url": data.get("source_url", "N/A")
+    }
 
-        GAME_CACHE[mission_id] = {
-            "is_hoax": data["is_hoax"],
-            "explanation": data["explanation"],
-            "source_url": data.get("source_url", "N/A")
-        }
-
-        return {
-            "mission_id": mission_id,
-            "news_snippet": data["news_snippet"]
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Gagal membuat kuis Hoax: {str(e)}")
-
+    return {"mission_id": mission_id, "news_snippet": data.get("news_snippet", "")}
 
 @app.post("/api/hoax-quiz/check")
 async def check_hoax_answer(request: HoaxCheckRequest):
     mission_id = request.mission_id
-    user_choice_str = request.user_choice.lower()
+    user_choice_str = request.user_choice.strip().lower()
 
     if mission_id not in GAME_CACHE:
         raise HTTPException(status_code=404, detail="Kuis tidak ditemukan atau sudah kedaluwarsa.")
 
-    cached_data = GAME_CACHE[mission_id]
-    correct_answer_bool = cached_data["is_hoax"]
-    correct_answer_str = "hoax" if correct_answer_bool else "fakta"
-    is_correct = (user_choice_str == correct_answer_str)
+    cached = GAME_CACHE[mission_id]
+    correct_bool = cached["is_hoax"]
+    correct_str = "hoax" if correct_bool else "fakta"
+    is_correct = (user_choice_str == correct_str)
     del GAME_CACHE[mission_id]
 
     return {
         "is_correct": is_correct,
-        "correct_answer": correct_answer_str.capitalize(),
-        "explanation": cached_data["explanation"],
-        "source_url": cached_data["source_url"]
+        "correct_answer": correct_str.capitalize(),
+        "explanation": cached["explanation"],
+        "source_url": cached["source_url"]
     }
 
-
-# ==============================================================================
-# API ENDPOINT - FITUR 3: LIBRARY HUB (Melengkapi Kata)
-# ==============================================================================
-
+# ======================================================================
+# Endpoint: Library Hub (generate full text)
+# ======================================================================
 @app.post("/api/library/generate-full-text")
 async def generate_library_full_text(request: LibraryGenerateRequest):
-    """
-    Membuat Teks Lengkap + Kuis Kata Hilang (tapi disembunyikan).
-    """
     game_id = str(uuid.uuid4())
-
     system_prompt = (
-        "Anda adalah seorang pendongeng / penulis artikel. "
-        "Tugas Anda adalah membuat DUA hal berdasarkan permintaan pengguna: "
-        "1. 'full_text': Teks lengkap (sekitar 150-200 kata) sesuai Format dan Genre. "
-        "2. 'blanks': Daftar TEPAT 5 kata penting dari teks tersebut untuk dijadikan kuis melengkapi kata. "
-        "JANGAN gunakan Markdown (seperti #, *, atau **)."
+        "Anda adalah penulis. Buat full_text sekitar 150-200 kata sesuai format dan genre, "
+        "dan berikan array 'blanks' tepat 5 kata penting dari teks. Return JSON with keys: full_text, blanks."
     )
     user_prompt = f"Format: {request.format}, Genre: {request.genre}"
 
-    payload = {
-        "systemInstruction": {"parts": [{"text": system_prompt}]},
-        "contents": [{"parts": [{"text": user_prompt}]}],
-        "generationConfig": {
-            "responseMimeType": "application/json",
-            "responseSchema": {
-                "type": "OBJECT",
-                "properties": {
-                    "full_text": {"type": "STRING"},
-                    "blanks": {
-                        "type": "ARRAY",
-                        "items": {"type": "STRING"},
-                        "description": "Tepat 5 kata"
-                    }
-                },
-                "required": ["full_text", "blanks"]
-            }
-        }
-    }
-
     try:
-        response_data = await call_ai(payload)
-        generated_data = response_data["candidates"][0]["content"]["parts"][0]["text"]
+        data = await call_ai_json(system_prompt=system_prompt, user_prompt=user_prompt, expect_json=True, max_tokens=800)
+    except HTTPException as e:
+        raise HTTPException(status_code=500, detail=f"Gagal membuat teks Library: {e.detail}")
 
-        import json
-        data = json.loads(generated_data)
+    # verify blanks exist
+    full_text = data.get("full_text", "")
+    blanks = data.get("blanks", [])
+    if not full_text or not isinstance(blanks, list) or len(blanks) == 0:
+        raise HTTPException(status_code=500, detail="AI tidak mengembalikan teks atau kata kunci yang valid.")
 
-        # --- PERBAIKAN BUG (VERIFIKASI KATA HILANG) ---
-        full_text_lower = data["full_text"].lower()
-        verified_blanks = []
+    full_lower = full_text.lower()
+    verified = []
+    for b in blanks:
+        cb = str(b).strip()
+        if cb and cb.lower().rstrip(".,?!") in full_lower:
+            verified.append(cb)
 
-        for blank in data["blanks"]:
-            # Cek jika kata (tanpa spasi) benar-benar ada di teks
-            # Kita juga cek tanpa tanda baca (sederhana)
-            clean_blank = blank.strip().lower().rstrip(".,?!")
-            if clean_blank and clean_blank in full_text_lower:
-                verified_blanks.append(blank.strip()) # Simpan versi asli (dengan huruf besar)
+    if not verified:
+        raise HTTPException(status_code=500, detail="AI gagal membuat kata kunci valid untuk teks ini.")
 
-        # Jika AI gagal total, kita tidak bisa melanjutkan game ini
-        if not verified_blanks:
-             raise HTTPException(status_code=500, detail="AI gagal membuat kata kunci yang valid untuk teks ini.")
-        # --- AKHIR PERBAIKAN ---
-
-        # Simpan data lengkap (termasuk jawaban YANG SUDAH DIVERIFIKASI) di cache
-        GAME_CACHE[game_id] = {
-            "full_text": data["full_text"],
-            "correct_answers": verified_blanks # <-- Gunakan list yang sudah bersih
-        }
-
-        # Kirimkan HANYA teks lengkap ke Laravel
-        return {
-            "game_id": game_id,
-            "full_text": data["full_text"],
-            "title": f"{request.format} ({request.genre})"
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Gagal membuat teks Library: {str(e)}")
-
+    GAME_CACHE[game_id] = {"full_text": full_text, "correct_answers": verified}
+    return {"game_id": game_id, "full_text": full_text, "title": f"{request.format} ({request.genre})"}
 
 @app.get("/api/library/get-quiz-text/{game_id}")
 async def get_library_quiz_text(game_id: str):
-    """
-    Mengambil data dari cache dan membuat teks dengan kata yang hilang.
-    """
     if game_id not in GAME_CACHE or "correct_answers" not in GAME_CACHE[game_id]:
         raise HTTPException(status_code=404, detail="Game tidak ditemukan atau data tidak valid.")
 
-    cached_data = GAME_CACHE[game_id]
-    full_text = cached_data["full_text"]
-    answers = cached_data["correct_answers"] # Ini adalah list yang sudah diverifikasi
-
-    text_with_blanks = full_text
+    cached = GAME_CACHE[game_id]
+    text = cached["full_text"]
+    answers = cached["correct_answers"]
     placeholder = "[.....]"
 
-    # Ganti kata jawaban dengan placeholder
-    for word in answers:
-        # Kita gunakan 'count=1' agar hanya mengganti kemunculan pertama
-        # Kita perlu cara yang lebih baik untuk replace case-insensitive
-        # Solusi sederhana: replace versi asli
-        if word in text_with_blanks:
-             text_with_blanks = text_with_blanks.replace(word, placeholder, 1)
-        # Fallback jika case-nya beda (misal 'Dia' vs 'dia')
-        elif word.lower() in text_with_blanks.lower():
-             # Ini rumit, untuk sementara kita pakai replace sederhana
-             text_with_blanks = text_with_blanks.replace(word, placeholder, 1, flags=re.IGNORECASE) # ups, butuh 're'
-             # Solusi lebih aman tanpa 're':
-             pass # Untuk saat ini, biarkan jika case-nya beda (akan difix di iterasi selanjutnya jika perlu)
-
-        # Logika replace yang paling aman adalah yang kita lakukan sebelumnya:
-        # Ganti kata di list 'answers' yang sudah diverifikasi
-        text_with_blanks = text_with_blanks.replace(word, placeholder, 1)
-
-
-    return {
-        "game_id": game_id,
-        "text_with_blanks": text_with_blanks,
-        "total_questions": len(answers)
-    }
-
+    # replace case-insensitive first occurrence per answer
+    for w in answers:
+        pattern = re.compile(re.escape(w), flags=re.IGNORECASE)
+        text, n = pattern.subn(placeholder, text, count=1)
+    return {"game_id": game_id, "text_with_blanks": text, "total_questions": len(answers)}
 
 @app.post("/api/library/validate-blanks/{game_id}")
 async def validate_library_blanks(game_id: str, request: LibraryQuizSubmitRequest):
-    """
-    Memeriksa jawaban kuis melengkapi kata.
-    """
     if game_id not in GAME_CACHE or "correct_answers" not in GAME_CACHE[game_id]:
         raise HTTPException(status_code=404, detail="Game tidak ditemukan atau jawaban tidak valid.")
-
-    cached_data = GAME_CACHE[game_id]
-    correct_answers = cached_data["correct_answers"]
+    cached = GAME_CACHE[game_id]
+    correct = cached["correct_answers"]
     user_answers = request.user_answers
 
-    # SEKARANG CEK INI HARUSNYA LOLOS KARENA VERIFIKASI DI ATAS
-    if len(user_answers) != len(correct_answers):
+    if len(user_answers) != len(correct):
         raise HTTPException(status_code=400, detail="Jumlah jawaban tidak sesuai.")
 
     results = []
-    total_score = 0
-    score_per_item = 100 / len(correct_answers)
-
-    for i in range(len(correct_answers)):
-        is_correct = user_answers[i].strip().lower() == correct_answers[i].strip().lower()
-        score = score_per_item if is_correct else 0
-        total_score += score
-
-        results.append({
-            "blank_index": i + 1,
-            "user_answer": user_answers[i],
-            "correct_answer": correct_answers[i],
-            "is_correct": is_correct
-        })
+    total = 0
+    per = 100 / len(correct)
+    for i in range(len(correct)):
+        ok = user_answers[i].strip().lower() == correct[i].strip().lower()
+        score = per if ok else 0
+        total += score
+        results.append({"blank_index": i+1, "user_answer": user_answers[i], "correct_answer": correct[i], "is_correct": ok})
 
     del GAME_CACHE[game_id]
+    return {"total_score": round(total), "results": results, "full_text": cached["full_text"]}
 
-    return {
-        "total_score": round(total_score),
-        "results": results,
-        "full_text": cached_data["full_text"]
-    }
-
-
-# ==============================================================================
-# API ENDPOINT - FITUR 4: ZONA TATA BAHASA (Perbaiki Kalimat)
-# ==============================================================================
-
+# ======================================================================
+# Endpoint: Grammar Zone
+# ======================================================================
 @app.post("/api/grammar-zone/generate-game")
 async def generate_grammar_game(request: GrammarGenerateRequest):
     game_id = str(uuid.uuid4())
-
     system_prompt = (
-        "Anda adalah asisten pembuat kuis tata bahasa. "
-        "Buat TEPAT 5 kalimat berdasarkan Genre yang diminta. "
-        "BEBERAPA kalimat harus benar secara tata bahasa, BEBERAPA harus salah (misal: typo, ejaan salah, struktur aneh). "
-        "Anda HARUS menghasilkan dua hal: "
-        "1. 'sentences_to_fix': Daftar 5 kalimat (campuran benar/salah). "
-        "2. 'correct_sentences': Daftar 5 kalimat versi benar/ideal (jika kalimat asli sudah benar, ulangi saja)."
-        "JANGAN gunakan Markdown."
+        "Anda pembuat kuis tata bahasa. Buat tepat 5 kalimat (campuran benar/salah). "
+        "Return JSON: { sentences_to_fix: [...], correct_sentences: [...] }"
     )
     user_prompt = f"Genre: {request.genre}"
-
-    payload = {
-        "systemInstruction": {"parts": [{"text": system_prompt}]},
-        "contents": [{"parts": [{"text": user_prompt}]}],
-        "generationConfig": {
-            "responseMimeType": "application/json",
-            "responseSchema": {
-                "type": "OBJECT",
-                "properties": {
-                    "sentences_to_fix": {
-                        "type": "ARRAY",
-                        "items": {"type": "STRING"}
-                    },
-                    "correct_sentences": {
-                        "type": "ARRAY",
-                        "items": {"type": "STRING"}
-                    }
-                },
-                "required": ["sentences_to_fix", "correct_sentences"]
-            }
-        }
-    }
-
     try:
-        response_data = await call_ai(payload)
-        generated_data = response_data["candidates"][0]["content"]["parts"][0]["text"]
+        data = await call_ai_json(system_prompt=system_prompt, user_prompt=user_prompt, expect_json=True, max_tokens=600)
+    except HTTPException as e:
+        raise HTTPException(status_code=500, detail=f"Gagal membuat game Tata Bahasa: {e.detail}")
 
-        import json
-        data = json.loads(generated_data)
-
-        GAME_CACHE[game_id] = {
-            "correct_sentences": data["correct_sentences"],
-            "original_sentences": data["sentences_to_fix"]
-        }
-
-        return {
-            "game_id": game_id,
-            "genre": request.genre,
-            "sentences_to_fix": data["sentences_to_fix"]
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Gagal membuat game Tata Bahasa: {str(e)}")
-
+    GAME_CACHE[game_id] = {"correct_sentences": data["correct_sentences"], "original_sentences": data["sentences_to_fix"]}
+    return {"game_id": game_id, "genre": request.genre, "sentences_to_fix": data["sentences_to_fix"]}
 
 @app.post("/api/grammar-zone/submit-game/{game_id}")
 async def submit_grammar_game(game_id: str, request: GrammarSubmitRequest):
     if game_id not in GAME_CACHE or "correct_sentences" not in GAME_CACHE[game_id]:
         raise HTTPException(status_code=404, detail="Game tidak ditemukan atau data tidak valid.")
 
-    cached_data = GAME_CACHE[game_id]
-    correct_sentences = cached_data["correct_sentences"]
-    original_sentences = cached_data["original_sentences"]
+    cached = GAME_CACHE[game_id]
+    correct_sentences = cached["correct_sentences"]
+    original_sentences = cached["original_sentences"]
     user_corrections = request.user_corrections
 
     if len(user_corrections) != len(correct_sentences):
         raise HTTPException(status_code=400, detail="Jumlah jawaban tidak sesuai.")
 
     results = []
-    total_score = 0
-    score_per_item = 100 / len(correct_sentences)
-
+    total = 0
+    per = 100 / len(correct_sentences)
     for i in range(len(correct_sentences)):
-        is_correct = user_corrections[i].strip().lower() == correct_sentences[i].strip().lower()
-        score = score_per_item if is_correct else 0
-        total_score += score
-
-        results.append({
-            "original": original_sentences[i],
-            "user_correction": user_corrections[i],
-            "correct_sentence": correct_sentences[i],
-            "is_correct": is_correct
-        })
+        ok = user_corrections[i].strip().lower() == correct_sentences[i].strip().lower()
+        score = per if ok else 0
+        total += score
+        results.append({"original": original_sentences[i], "user_correction": user_corrections[i], "correct_sentence": correct_sentences[i], "is_correct": ok})
 
     del GAME_CACHE[game_id]
+    return {"total_score": round(total), "results": results}
 
-    return {
-        "total_score": round(total_score),
-        "results": results,
-    }
-
-
-# ==============================================================================
-# ENTRY POINT UNTUK MENJALANKAN SERVER (jika dijalankan sebagai script)
-# ==============================================================================
+# ======================================================================
+# Run (for local dev)
+# ======================================================================
 if __name__ == "__main__":
     uvicorn.run("main:app", host="127.0.0.1", port=8001, reload=True)
