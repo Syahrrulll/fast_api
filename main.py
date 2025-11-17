@@ -2,7 +2,7 @@ import os
 import httpx
 import uvicorn
 import uuid
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, Form
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel, Field
 from typing import List, Dict, Any
@@ -17,10 +17,8 @@ app = FastAPI(title="Literise AI Service", version="1.0")
 CHUTES_API_KEY = os.getenv("CHUTES_API_KEY","cpk_49d03a0e918f44c5b753d8aefa411eb0.0140b8ee2e8c5bfbae7e6bc921a677ba.VYnSymDVRjdpY53MK4NduBfyff9RKdoD")
 
 # URL CHUTES ala gaya GEMINI
-CHUTES_API_URL = (
-    "https://llm.chutes.ai/v1/chat/completions"
-    f"?key={CHUTES_API_KEY}"
-)
+CHUTES_API_URL = "https://llm.chutes.ai/v1/chat/completions"
+
 
 # ==========================
 # HALAMAN ROOT ("/")
@@ -85,28 +83,53 @@ async def call_ai(messages: list):
         "messages": messages
     }
 
-    # HARUS bikin client PER REQUEST (aman untuk Vercel)
     async with httpx.AsyncClient(timeout=40) as client:
-        res = await client.post(CHUTES_API_URL, json=payload, headers=headers)
-        res.raise_for_status()
-        return res.json()
+        r = await client.post(CHUTES_API_URL, json=payload, headers=headers)
+        print("STATUS:", r.status_code)
+        print("RESPONSE:", r.text)
+        r.raise_for_status()
+        return r.json()
 
-# ==========================
-# ENDPOINT CHAT
-# ==========================
-@app.post("/chat")
-async def chat(data: dict):
-    user_msg = data.get("message", "")
+# -------------------------------------------------------------------
+# GET /chat → HALAMAN HTML UNTUK TEST CHAT
+# -------------------------------------------------------------------
+@app.get("/chat", response_class=HTMLResponse)
+async def chat_page():
+    return """
+    <html>
+        <head><title>Chat Kimmi</title></head>
+        <body style="font-family: Arial; padding: 20px;">
+            <h2>Chat Dengan AI (Kimmi)</h2>
+            <form action="/chat" method="post">
+                <textarea name="message" rows="5" cols="40" placeholder="Tulis pesan..."></textarea><br><br>
+                <button type="submit">Kirim</button>
+            </form>
+        </body>
+    </html>
+    """
 
+# -------------------------------------------------------------------
+# POST /chat → MEMPROSES FORM HTML
+# -------------------------------------------------------------------
+@app.post("/chat", response_class=HTMLResponse)
+async def chat(message: str = Form(...)):
     messages = [
-        {"role": "user", "content": user_msg}
+        {"role": "user", "content": message}
     ]
 
     ai_res = await call_ai(messages)
-
     reply = ai_res["choices"][0]["message"]["content"]
 
-    return {"reply": reply}
+    return f"""
+    <html>
+        <body style="font-family: Arial; padding: 20px;">
+            <h2>Jawaban AI:</h2>
+            <pre>{reply}</pre>
+            <br>
+            <a href="/chat">Kembali</a>
+        </body>
+    </html>
+    """
 # ==============================================================================
 # MODEL DATA (PYDANTIC) UNTUK VALIDASI REQUEST
 # ==============================================================================
