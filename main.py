@@ -3,6 +3,7 @@ import httpx
 import uvicorn
 import uuid
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel, Field
 from typing import List, Dict, Any
 
@@ -80,7 +81,7 @@ async def call_ai(messages: list):
     }
 
     payload = {
-        "model": "AI",      # sesuai permintaan → tidak spesifik
+        "model": "moonshotai/Kimi-K2-Instruct-0905",
         "messages": messages
     }
 
