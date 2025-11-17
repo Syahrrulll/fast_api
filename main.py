@@ -14,7 +14,7 @@ app = FastAPI(title="Literise AI Service", version="1.0")
 # ==========================
 # CONFIG API AI (CHUTES)
 # ==========================
-CHUTES_API_KEY = os.getenv("CHUTES_API_KEY")
+CHUTES_API_KEY = os.getenv("CHUTES_API_KEY","cpk_49d03a0e918f44c5b753d8aefa411eb0.0140b8ee2e8c5bfbae7e6bc921a677ba.VYnSymDVRjdpY53MK4NduBfyff9RKdoD")
 
 # URL CHUTES ala gaya GEMINI
 CHUTES_API_URL = (
